@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 62011",
     "build": "tsc -b && vite build",
-    "preview": "vite preview --host 0.0.0.0 --port 62011"
+    "preview": "vite preview --host 0.0.0.0 --port 62011",
+    "verify": "esbuild scripts/verify.mjs --bundle --platform=node --format=cjs --outfile=node_modules/.verify-engine.cjs --log-level=warning && node node_modules/.verify-engine.cjs && esbuild scripts/verify-thunk.mjs --bundle --platform=node --format=esm --outfile=node_modules/.verify-thunk.mjs --log-level=warning && node node_modules/.verify-thunk.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

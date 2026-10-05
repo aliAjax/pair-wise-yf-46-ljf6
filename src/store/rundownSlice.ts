@@ -1,87 +1,210 @@
 import { createSlice, type PayloadAction } from "@reduxjs/toolkit";
-import type { BreakingChange, HistoryEntry, PendingChange, Role, RundownItem } from "../types";
+import type {
+  ChangeSpec, CommitResult, FieldKey, QueuedChange, Role, RundownDoc
+} from "../types";
+import {
+  applyChange, buildEntries, checkConflict, targetRevesOf, timelineStartAt, undoEntry
+} from "./engine";
+import { hydrateOrSeed, readDoc, writeDoc } from "./persistence";
+import { makeSeedDoc } from "./seed";
+import type { AppDispatch, RootState } from "./index";
 
-const seed: RundownItem[] = [
-  { id: "r1", title: "早间新闻提要", type: "新闻片", duration: 4, hardStart: "08:00", status: "已播出", presenter: "陈默", source: "主控" },
-  { id: "r2", title: "城市更新现场连线", type: "连线", duration: 8, hardStart: "08:06", status: "待播", presenter: "陈默", source: "记者周岚" },
-  { id: "r3", title: "政策发布会解读", type: "嘉宾", duration: 12, status: "待播", presenter: "陈默", source: "演播室A" },
-  { id: "r4", title: "整点广告", type: "广告", duration: 3, hardStart: "08:30", status: "待播", presenter: "系统", source: "广告串" }
-];
+const CLIENT_KEY = "pair-wise-yf-46/client";
+
+function loadClientId(): string {
+  const existing = sessionStorage.getItem(CLIENT_KEY);
+  if (existing) return existing;
+  const id = crypto.randomUUID().slice(0, 4);
+  sessionStorage.setItem(CLIENT_KEY, id);
+  return id;
+}
 
 interface State {
-  initialized: boolean;
-  items: RundownItem[];
-  history: HistoryEntry[];
-  queue: PendingChange[];
-  changes: BreakingChange[];
+  doc: RundownDoc;
   role: Role;
   online: boolean;
+  clientId: string;
+  /** 离线应急队列（最新在前） */
+  queue: QueuedChange[];
 }
 
-const initialState: State = { initialized: false, items: seed, history: [], queue: [], changes: [], role: "导播", online: true };
-
-function snapshot(items: RundownItem[], label: string, detail: string): HistoryEntry {
-  return { id: crypto.randomUUID(), label, detail, time: new Date().toISOString(), snapshot: structuredClone(items) };
-}
+const initialState: State = {
+  doc: makeSeedDoc(),
+  role: "导播",
+  online: true,
+  clientId: loadClientId(),
+  queue: []
+};
 
 const slice = createSlice({
   name: "rundown",
   initialState,
   reducers: {
-    initialize(state, action: PayloadAction<RundownItem[]>) {
-      if (!state.initialized) {
-        state.items = action.payload.length ? action.payload : seed;
-        state.initialized = true;
-      }
+    hydrate(state, action: PayloadAction<RundownDoc>) {
+      state.doc = action.payload;
     },
     setRole(state, action: PayloadAction<Role>) { state.role = action.payload; },
     setOnline(state, action: PayloadAction<boolean>) { state.online = action.payload; },
-    addItem(state, action: PayloadAction<Omit<RundownItem, "id" | "status">>) {
-      state.history.unshift(snapshot(state.items, "新增条目", action.payload.title));
-      state.items.push({ ...action.payload, id: crypto.randomUUID(), status: "草稿" });
+    enqueue(state, action: PayloadAction<QueuedChange>) {
+      state.queue.unshift(action.payload);
     },
-    updateStatus(state, action: PayloadAction<{ id: string; status: RundownItem["status"] }>) {
-      const item = state.items.find((entry) => entry.id === action.payload.id);
-      if (!item) return;
-      state.history.unshift(snapshot(state.items, "播出状态", `${item.title} → ${action.payload.status}`));
-      item.status = action.payload.status;
+    dropQueued(state, action: PayloadAction<string>) {
+      state.queue = state.queue.filter((item) => item.id !== action.payload);
     },
-    reorder(state, action: PayloadAction<RundownItem[]>) {
-      state.history.unshift(snapshot(state.items, "调整顺序", "直播串联单顺序变化"));
-      state.items = action.payload;
-    },
-    adjustDuration(state, action: PayloadAction<{ id: string; delta: number }>) {
-      const item = state.items.find((entry) => entry.id === action.payload.id);
-      if (!item) return;
-      state.history.unshift(snapshot(state.items, "调整时长", `${item.title} ${action.payload.delta > 0 ? "增加" : "减少"} ${Math.abs(action.payload.delta)} 分钟`));
-      item.duration = Math.max(1, item.duration + action.payload.delta);
-    },
-    insertBreaking(state, action: PayloadAction<Omit<BreakingChange, "id" | "createdAt">>) {
-      const change: BreakingChange = { ...action.payload, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
-      const index = state.items.findIndex((item) => item.id === change.insertAfter);
-      state.history.unshift(snapshot(state.items, "突发插播", change.headline));
-      state.items.splice(index + 1, 0, { id: crypto.randomUUID(), title: change.headline, type: "新闻片", duration: change.duration, status: "待播", presenter: "值班主播", source: `插播：${change.reason}` });
-      state.changes.unshift(change);
-      if (!state.online) state.queue.unshift({ id: crypto.randomUUID(), action: "突发插播", detail: change.headline, queuedAt: change.createdAt });
-    },
-    skipItem(state, action: PayloadAction<string>) {
-      const item = state.items.find((entry) => entry.id === action.payload);
-      if (!item) return;
-      state.history.unshift(snapshot(state.items, "取消条目", item.title));
-      item.status = "已跳过";
-      if (!state.online) state.queue.unshift({ id: crypto.randomUUID(), action: "取消条目", detail: item.title, queuedAt: new Date().toISOString() });
-    },
-    undo(state) {
-      const last = state.history.shift();
-      if (!last) return;
-      state.items = structuredClone(last.snapshot);
-    },
-    queueChange(state, action: PayloadAction<{ action: string; detail: string }>) {
-      state.queue.unshift({ ...action.payload, id: crypto.randomUUID(), queuedAt: new Date().toISOString() });
-    },
-    syncQueue(state) { state.queue = []; }
+    clearQueue(state) { state.queue = []; }
   }
 });
 
-export const { initialize, setRole, setOnline, addItem, updateStatus, reorder, adjustDuration, insertBreaking, skipItem, undo, queueChange, syncQueue } = slice.actions;
+export const { hydrate, setRole, setOnline, enqueue, dropQueued, clearQueue } = slice.actions;
+
+/** 启动：从服务端文档（localStorage）加载，首次访问则播种并落库 */
+export function bootstrap() {
+  return (dispatch: AppDispatch) => {
+    const doc = hydrateOrSeed(makeSeedDoc());
+    dispatch(hydrate(structuredClone(doc)));
+  };
+}
+
+/** 别的窗口保存后，通过 storage 事件推送权威文档 */
+export function ingestExternalDoc(doc: RundownDoc) {
+  return (_dispatch: AppDispatch, getState: () => RootState) => {
+    const { clientId, queue, online } = getState().rundown;
+    // 本地应急队列还有未提交改动时，不能让外部推送冲掉本地视图；
+    // 待主链路恢复、队列重放完成后自然会 hydrate 到权威版本
+    if (!online || queue.length > 0) return null;
+    const latest = doc.log[0];
+    _dispatch(hydrate(structuredClone(doc)));
+    if (latest && latest.clientId !== clientId && !latest.undone) {
+      return { role: latest.role, clientId: latest.clientId, detail: latest.detail };
+    }
+    return null;
+  };
+}
+
+/**
+ * 提交一次改动。
+ * 在线：按条目版本号做条件写入——版本被别的窗口抢先保存过就判冲突，本次不写入。
+ * 离线：本地立即生效并入应急队列，主链路恢复后重放。
+ */
+export function commit(spec: ChangeSpec, baseReves?: Record<string, number>): (dispatch: AppDispatch, getState: () => RootState) => CommitResult {
+  return (dispatch, getState) => {
+    const { doc, role, clientId, online, queue } = getState().rundown;
+    const ctx = { role, clientId, pending: !online, timelineStart: timelineStartAt };
+
+    if (online) {
+      const server = readDoc() ?? doc;
+      const built = buildEntries(server, spec, ctx);
+      if ("error" in built) return { type: "blocked", message: built.error };
+      const conflict = checkConflict(server, spec, baseReves ?? targetRevesOf(server, spec), clientId);
+      if (conflict.conflict) return { type: "conflict", message: conflict.message! };
+      const next = applyChange(server, spec, built.result.entries, { asRun: built.result.asRun, breakingId: built.result.breakingId });
+      writeDoc(next);
+      dispatch(hydrate(structuredClone(next)));
+      return { type: "ok" };
+    }
+
+    // 本地应急模式
+    const built = buildEntries(doc, spec, { ...ctx, pending: true });
+    if ("error" in built) return { type: "blocked", message: built.error };
+    const next = applyChange(doc, spec, built.result.entries, { asRun: built.result.asRun, breakingId: built.result.breakingId });
+    const queued: QueuedChange = {
+      id: crypto.randomUUID(),
+      spec: structuredClone(spec),
+      role,
+      clientId,
+      queuedAt: new Date().toISOString(),
+      detail: built.result.entries[0]?.detail ?? "改动",
+      itemTitle: built.result.entries[0]?.itemTitle ?? "",
+      targetReves: targetRevesOf(doc, spec),
+      entryIds: built.result.entries.map((entry) => entry.id)
+    };
+    dispatch(hydrate(next));
+    dispatch(enqueue(queued));
+    void queue;
+    return { type: "ok", message: "已进入本地应急队列，主链路恢复后提交" };
+  };
+}
+
+/**
+ * 撤回一条改动（逆操作，只抵消选中那一次）。
+ * 在线：直接对服务端文档判断并写入，挡得住时给出原因。
+ * 离线：只允许撤回本窗口尚未提交的应急操作。
+ */
+export function undoOne(entryId: string): (dispatch: AppDispatch, getState: () => RootState) => CommitResult {
+  return (dispatch, getState) => {
+    const { doc, role, clientId, online, queue } = getState().rundown;
+
+    if (!online) {
+      const entry = doc.log.find((item) => item.id === entryId);
+      if (!entry) return { type: "blocked", message: "找不到这条改动" };
+      if (!entry.pending || entry.clientId !== clientId) {
+        return { type: "blocked", message: "离线状态只能撤回本窗口尚未提交的改动；这条已经在主链路上，请恢复连接后再撤" };
+      }
+      const localResult = undoEntry(doc, entryId, role);
+      if ("error" in localResult) return { type: "blocked", message: localResult.error };
+      const op = queue.find((item) => item.entryIds.includes(entryId));
+      if (op) {
+        if (op.spec.kind === "编辑") {
+          // 多字段编辑按条抵消：重放时跳过已撤回的字段
+          const live = op.entryIds
+            .map((id) => localResult.doc.log.find((logEntry) => logEntry.id === id))
+            .filter((logEntry): logEntry is NonNullable<typeof logEntry> => !!logEntry && !logEntry.undone);
+          const stillHasFields = live.some((logEntry) => logEntry.kind === "编辑");
+          if (!stillHasFields) dispatch(dropQueued(op.id));
+        } else {
+          dispatch(dropQueued(op.id));
+        }
+      }
+      dispatch(hydrate(localResult.doc));
+      return { type: "ok", message: localResult.message };
+    }
+
+    const server = readDoc() ?? doc;
+    const result = undoEntry(server, entryId, role);
+    if ("error" in result) return { type: "blocked", message: result.error };
+    writeDoc(result.doc);
+    dispatch(hydrate(structuredClone(result.doc)));
+    return { type: "ok", message: result.message };
+  };
+}
+
+/** 主链路恢复：按顺序重放应急队列，逐条做版本冲突判断 */
+export function syncQueue() {
+  return async (dispatch: AppDispatch, getState: () => RootState) => {
+    const state = getState().rundown;
+    if (!state.queue.length) return { synced: 0, conflicts: [] as string[], blocked: [] as string[] };
+    let server = readDoc() ?? state.doc;
+    const conflicts: string[] = [];
+    const blocked: string[] = [];
+    let synced = 0;
+
+    const pending = [...state.queue].reverse(); // 入队顺序（旧 -> 新）
+    for (const op of pending) {
+      let spec = op.spec;
+      if (spec.kind === "编辑") {
+        const undoneFields = new Set<FieldKey>();
+        for (const id of op.entryIds) {
+          const local = state.doc.log.find((entry) => entry.id === id);
+          if (local?.undone && local.fields?.[0]) undoneFields.add(local.fields[0].field);
+        }
+        const fields = spec.fields.filter((f) => !undoneFields.has(f.field));
+        if (!fields.length) continue;
+        spec = { ...spec, fields };
+      }
+      const ctx = { role: op.role, clientId: op.clientId, pending: false, timelineStart: timelineStartAt };
+      const built = buildEntries(server, spec, ctx);
+      if ("error" in built) { blocked.push(`${op.itemTitle}：${built.error}`); continue; }
+      const conflict = checkConflict(server, spec, op.targetReves, op.clientId);
+      if (conflict.conflict) { conflicts.push(conflict.message!); continue; }
+      server = applyChange(server, spec, built.result.entries, { asRun: built.result.asRun, breakingId: built.result.breakingId });
+      synced += 1;
+    }
+
+    writeDoc(server);
+    dispatch(hydrate(structuredClone(server)));
+    dispatch(clearQueue());
+    return { synced, conflicts, blocked };
+  };
+}
+
 export default slice.reducer;
